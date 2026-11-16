@@ -49,7 +49,7 @@ The widget never takes keyboard focus, so everything is done with the mouse or t
 | Drag anywhere on the widget | Move it. It remembers where you leave it, across restarts. |
 | Click the header | Collapse to just the header, or expand again. |
 | Hover over an active thread | After a moment, a pop-up beside the widget shows the full text of what the agent is doing right now (the whole message, reasoning, command and output, or tool input and output), scrolled to the newest lines. It updates live; move onto it to scroll. |
-| Click a thread | Bring T3 Code to the front. |
+| Click a thread | Bring T3 Code to the front with that thread selected (also for threads on linked machines). |
 | Click the activity graphic | Switch between the robot and the cat. |
 | Pinch in or out | Zoom between 100% and 300%. |
 | ⌘ + scroll | Zoom between 100% and 300%. |

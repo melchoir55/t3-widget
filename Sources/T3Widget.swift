@@ -21,6 +21,7 @@ enum Config {
     static let userData = home.appendingPathComponent(".t3/userdata")
     static let dbPath = userData.appendingPathComponent("statev2.sqlite").path
     static let runtimePath = userData.appendingPathComponent("server-runtime.json").path
+    static let environmentIDPath = userData.appendingPathComponent("environment-id").path
     static let cliPath = home.appendingPathComponent(".t3/bin/t3").path
     static let supportDir = home.appendingPathComponent("Library/Application Support/T3Widget")
     static let sessionPath = supportDir.appendingPathComponent("mcp-session.json").path
@@ -1104,7 +1105,7 @@ struct ActiveRow: View {
                 .onAppear { onFrame(g.frame(in: .global)) }
                 .onChange(of: g.frame(in: .global)) { onFrame($0) }
         })
-        .onTapGesture(perform: openT3)
+        .onTapGesture { openThread(thread.id) }
     }
 }
 
@@ -1161,13 +1162,28 @@ struct RecentRow: View {
                 .font(.system(size: 10 * z).monospacedDigit()).foregroundStyle(.secondary)
         }
         .contentShape(Rectangle())
-        .onTapGesture(perform: openT3)
+        .onTapGesture { openThread(thread.id) }
     }
 }
 
 func openT3() {
     guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: Config.t3BundleID) else { return }
     NSWorkspace.shared.openApplication(at: url, configuration: .init())
+}
+
+/// Bring T3 Code to the front with this thread selected, through its `t3code://threads/<env>/<thread>`
+/// deep link. Thread ids are "<env>/<thread>" for linked machines and a bare thread id for this Mac,
+/// whose environment id T3 keeps in ~/.t3/userdata/environment-id. Falls back to just opening T3.
+func openThread(_ id: String) {
+    var path = id
+    if !id.contains("/") {
+        guard let env = try? String(contentsOfFile: Config.environmentIDPath, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines), !env.isEmpty else { return openT3() }
+        path = env + "/" + id
+    }
+    guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: Config.t3BundleID),
+          let link = URL(string: "t3code://threads/" + path) else { return openT3() }
+    NSWorkspace.shared.open([link], withApplicationAt: appURL, configuration: NSWorkspace.OpenConfiguration())
 }
 
 // MARK: - Window
