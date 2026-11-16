@@ -184,6 +184,22 @@ func backgroundTaskIDs(in text: String) -> [String] {
     return ids
 }
 
+/// How long the harness lets a backgrounded command run before stopping it, from its launch
+/// text ("If it is still running after 30m in the background, it will be stopped"). 30 min if
+/// the text doesn't say.
+func backgroundTimeLimit(in text: String) -> TimeInterval {
+    guard let r = text.range(of: "still running after "),
+          let end = text[r.upperBound...].range(of: " in the background") else { return 30 * 60 }
+    let spec = text[r.upperBound..<end.lowerBound]
+    guard let unit = spec.last, let n = Double(spec.dropLast()) else { return 30 * 60 }
+    switch unit {
+    case "s": return n
+    case "m": return n * 60
+    case "h": return n * 3600
+    default: return 30 * 60
+    }
+}
+
 /// True for a tool call that collects or ends a background task (its text names the task ID).
 func stopsTask(_ text: String) -> Bool {
     ["\"TaskOutput\"", "\"TaskStop\"", "\"KillShell\"", "\"KillBash\""].contains { text.contains($0) }
@@ -542,7 +558,9 @@ final class RemoteStore: @unchecked Sendable {
     private let mcp = McpClient()
     private var projectTitles: [String: (fetched: Date, titles: [String: String])] = [:]
     /// Background work per ended thread, keyed by env/thread and reused until updatedAt changes.
-    private var backgroundCache: [String: (updatedAt: String, tasks: Int, subagents: Int)] = [:]
+    /// `deadlines`: when each backgrounded command still counted as pending stops counting.
+    private var backgroundCache: [String: (updatedAt: String, tasks: Int, subagents: Int,
+                                           deadlines: [Date])] = [:]
 
     func snapshot() -> Snapshot {
         var snap = Snapshot()
@@ -623,16 +641,23 @@ final class RemoteStore: @unchecked Sendable {
     /// changes.
     ///
     /// A command sent to the background shows as a *completed* item whose output reads
-    /// "Command running in background with ID: X". Its completion wakes the agent in a new
-    /// run, so within the latest run such a task counts as pending unless the agent collected
-    /// or stopped it there (TaskOutput, TaskStop, KillShell naming that ID).
+    /// "Command running in background with ID: X". The API never says when it finishes: one
+    /// that ends mid-turn leaves no trace. But the harness stops such a task after a time limit
+    /// stated in that same text (30m by default), so it counts as pending until then, unless
+    /// the agent collected or stopped it first (TaskOutput, TaskStop, KillShell naming its ID).
     private func backgroundWork(envID: String, threadID: String, updatedAt: String) throws
         -> (tasks: Int, subagents: Int)
     {
         let key = envID + "/" + threadID
-        if let c = backgroundCache[key], c.updatedAt == updatedAt { return (c.tasks, c.subagents) }
+        func count(_ c: (updatedAt: String, tasks: Int, subagents: Int, deadlines: [Date]))
+            -> (tasks: Int, subagents: Int)
+        {
+            let now = Date()
+            return (c.tasks + c.deadlines.filter { $0 > now }.count, c.subagents)
+        }
+        if let c = backgroundCache[key], c.updatedAt == updatedAt { return count(c) }
         var tasks = 0, subagents = 0
-        var launched: [String] = [], reaped: [String] = []
+        var launches: [(id: String, deadline: Date)] = [], reaped: [String] = []
         var after: Int?
         for _ in 0..<20 {
             var args: [String: Any] = [
@@ -646,7 +671,10 @@ final class RemoteStore: @unchecked Sendable {
                 let type = item["type"] as? String ?? ""
                 let text = item["text"] as? String ?? ""
                 if type == "command_execution" || type == "dynamic_tool" {
-                    launched += backgroundTaskIDs(in: text)
+                    if let at = parseDate(item["updatedAt"] as? String) {
+                        let limit = backgroundTimeLimit(in: text)
+                        launches += backgroundTaskIDs(in: text).map { ($0, at.addingTimeInterval(limit)) }
+                    }
                     if type == "dynamic_tool", stopsTask(text) { reaped.append(text) }
                 }
                 guard status == "running" || status == "waiting" else { continue }
@@ -659,9 +687,10 @@ final class RemoteStore: @unchecked Sendable {
             guard page["hasMore"] as? Bool == true, let next = page["nextPosition"] as? Int else { break }
             after = next
         }
-        tasks += Set(launched).filter { id in !reaped.contains { $0.contains(id) } }.count
-        backgroundCache[key] = (updatedAt, tasks, subagents)
-        return (tasks, subagents)
+        let deadlines = launches.filter { l in !reaped.contains { $0.contains(l.id) } }.map(\.deadline)
+        let entry = (updatedAt, tasks, subagents, deadlines)
+        backgroundCache[key] = entry
+        return count(entry)
     }
 
     /// Project id → title for an environment, refreshed every 5 minutes.
