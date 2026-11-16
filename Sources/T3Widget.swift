@@ -161,10 +161,11 @@ func describeItem(type: String, text: String, input: String = "", output: String
     }
 }
 
-/// e.g. "Waiting on 2 background tasks, 1 subagent".
-func waitingLabel(bgTasks: Int, subagents: Int) -> String {
+/// e.g. "Waiting on 2 background tasks, 1 subagent, 1 PR".
+func waitingLabel(bgTasks: Int, subagents: Int, prWatches: Int = 0) -> String {
     func plural(_ n: Int, _ word: String) -> String { "\(n) \(word)\(n == 1 ? "" : "s")" }
     var parts: [String] = []
+    if prWatches > 0 { parts.append(plural(prWatches, "PR")) }
     if bgTasks > 0 { parts.append(plural(bgTasks, "background task")) }
     if subagents > 0 { parts.append(plural(subagents, "subagent")) }
     return parts.isEmpty ? "Waiting" : "Waiting on " + parts.joined(separator: ", ")
@@ -285,7 +286,7 @@ final class T3Store: @unchecked Sendable {
         // T3's sidebar labels those "Waiting" / "Awaiting Input", not ended.
         let threadsSQL = """
             SELECT thread_id, title, project, status, requested_at, completed_at, last_user,
-                   bg_tasks, live_subagents, pending_request
+                   bg_tasks, live_subagents, pending_request, pr_watches
             FROM (
               SELECT t.thread_id, t.title, COALESCE(p.title, '') AS project, r.status,
                      r.requested_at, r.completed_at,
@@ -300,7 +301,9 @@ final class T3Store: @unchecked Sendable {
                               OR s.completion_delivery_state IN ('pending', 'claimed'))) AS live_subagents,
                      (SELECT q.kind FROM orchestration_v2_projection_runtime_requests q
                        WHERE q.thread_id = t.thread_id AND q.status = 'pending'
-                       ORDER BY q.created_at DESC LIMIT 1) AS pending_request
+                       ORDER BY q.created_at DESC LIMIT 1) AS pending_request,
+                     (SELECT COUNT(*) FROM json_each(t.payload_json, '$.pullRequests') pr
+                       WHERE json_extract(pr.value, '$.watch') IS NOT NULL) AS pr_watches
               FROM orchestration_v2_projection_threads t
               JOIN orchestration_v2_projection_runs r
                 ON r.thread_id = t.thread_id
@@ -312,7 +315,7 @@ final class T3Store: @unchecked Sendable {
                     <> 'subagent'
             )
             WHERE status IN (\(statuses)) OR completed_at >= ?1
-               OR bg_tasks > 0 OR live_subagents > 0 OR pending_request IS NOT NULL
+               OR bg_tasks > 0 OR live_subagents > 0 OR pending_request IS NOT NULL OR pr_watches > 0
             """
 
         struct Row {
@@ -320,6 +323,7 @@ final class T3Store: @unchecked Sendable {
             let requested, completed, lastUser: String?
             let bgTasks, liveSubagents: Int
             let pendingRequest: String?
+            let prWatches: Int
         }
         var rows: [Row] = []
         do {
@@ -330,7 +334,8 @@ final class T3Store: @unchecked Sendable {
                     requested: text(s, 4), completed: text(s, 5), lastUser: text(s, 6),
                     bgTasks: Int(sqlite3_column_int(s, 7)),
                     liveSubagents: Int(sqlite3_column_int(s, 8)),
-                    pendingRequest: text(s, 9)))
+                    pendingRequest: text(s, 9),
+                    prWatches: Int(sqlite3_column_int(s, 10))))
             }
         } catch {
             snap.error = error.localizedDescription
@@ -339,7 +344,7 @@ final class T3Store: @unchecked Sendable {
 
         for row in rows {
             let runActive = Config.activeStatuses.contains(row.status)
-            let busy = row.bgTasks > 0 || row.liveSubagents > 0
+            let busy = row.bgTasks > 0 || row.liveSubagents > 0 || row.prWatches > 0
             if runActive || busy || row.pendingRequest != nil {
                 let latest = latestOutput(threadID: row.id)
                 var activity = latest.activity
@@ -349,7 +354,8 @@ final class T3Store: @unchecked Sendable {
                     activity = kind == "user_input" ? "Waiting for your answer" : "Needs your approval"
                 } else if !runActive || row.status == "waiting" {
                     status = "waiting"
-                    activity = waitingLabel(bgTasks: row.bgTasks, subagents: row.liveSubagents)
+                    activity = waitingLabel(bgTasks: row.bgTasks, subagents: row.liveSubagents,
+                                            prWatches: row.prWatches)
                 }
                 snap.active.append(ActiveThread(
                     id: row.id, title: row.title, project: row.project, environment: nil,
@@ -557,6 +563,8 @@ final class McpClient {
 final class RemoteStore: @unchecked Sendable {
     private let mcp = McpClient()
     private var projectTitles: [String: (fetched: Date, titles: [String: String])] = [:]
+    /// Watched-PR count per ended thread with an open PR: env/thread → (updatedAt, fetched, count).
+    private var prWatchCache: [String: (updatedAt: String, fetched: Date, count: Int)] = [:]
     /// Background work per ended thread, keyed by env/thread and reused until updatedAt changes.
     /// `deadlines`: when each backgrounded command still counted as pending stops counting.
     private var backgroundCache: [String: (updatedAt: String, tasks: Int, subagents: Int,
@@ -615,17 +623,19 @@ final class RemoteStore: @unchecked Sendable {
         for t in try threads(envID, statuses: Config.endedStatuses, limit: 50) {
             guard let id = t["threadId"] as? String,
                   let updated = parseDate(t["updatedAt"] as? String), updated >= cutoff else { continue }
-            // A finished turn can leave subagents or background commands running: in progress.
+            // A finished turn can leave subagents or background commands running, or a watched
+            // PR whose checks will wake it: in progress.
+            let prs = prWatches(envID: envID, thread: t)
             if let work = try? backgroundWork(envID: envID, threadID: id,
                                               updatedAt: t["updatedAt"] as? String ?? ""),
-               work.tasks + work.subagents > 0 {
+               work.tasks + work.subagents + prs > 0 {
                 let latest = try? latestActivity(envID: envID, threadID: id,
                                                  itemCount: t["itemCount"] as? Int ?? 0)
                 snap.active.append(ActiveThread(
                     id: envID + "/" + id, title: t["title"] as? String ?? "Untitled",
                     project: titles[t["projectId"] as? String ?? ""] ?? "", environment: label,
                     status: "waiting", startedAt: latest?.started,
-                    activity: waitingLabel(bgTasks: work.tasks, subagents: work.subagents),
+                    activity: waitingLabel(bgTasks: work.tasks, subagents: work.subagents, prWatches: prs),
                     output: latest?.summary.output ?? "", detail: latest?.summary.detail ?? ""))
                 continue
             }
@@ -691,6 +701,25 @@ final class RemoteStore: @unchecked Sendable {
         let entry = (updatedAt, tasks, subagents, deadlines)
         backgroundCache[key] = entry
         return count(entry)
+    }
+
+    /// PRs the thread's agent is watching (T3 wakes it when their checks finish). The thread list
+    /// only says a PR is linked, so this asks for the thread's PRs, only when one is open, and
+    /// reuses the answer for 2 minutes while updatedAt stays the same.
+    private func prWatches(envID: String, thread t: [String: Any]) -> Int {
+        guard let id = t["threadId"] as? String,
+              (t["pullRequests"] as? [[String: Any]] ?? []).contains(where: { $0["state"] as? String == "open" })
+        else { return 0 }
+        let key = envID + "/" + id, updatedAt = t["updatedAt"] as? String ?? ""
+        if let c = prWatchCache[key], c.updatedAt == updatedAt,
+           Date().timeIntervalSince(c.fetched) < 120 { return c.count }
+        guard let result = try? mcp.call("list_thread_pull_requests",
+                                         ["environmentId": envID, "threadId": id])
+        else { return prWatchCache[key]?.count ?? 0 }
+        let count = (result["pullRequests"] as? [[String: Any]] ?? [])
+            .filter { $0["watching"] as? Bool == true }.count
+        prWatchCache[key] = (updatedAt, Date(), count)
+        return count
     }
 
     /// Project id → title for an environment, refreshed every 5 minutes.
