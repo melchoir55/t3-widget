@@ -3,7 +3,8 @@
 A small always-on-top **macOS** panel for T3 Code, pinned to the top-left corner of the main screen, that shows:
 
 - **Active T3 Code threads**: title, project, elapsed time, what the agent is doing right now
-  (shell command, tool, thinking, writing), and the last few lines of its output.
+  (shell command, tool, thinking, writing), and the last few lines of its output. Hover over
+  one to see the full text.
 - **Threads that ended in the last 24 hours**, most recently interacted with first.
 - Threads from **every linked environment** (your other machines), tagged `@ <machine>`.
 - An **activity graphic** in the header that animates while any thread is working: a robot
@@ -47,6 +48,7 @@ The widget never takes keyboard focus, so everything is done with the mouse or t
 | --- | --- |
 | Drag anywhere on the widget | Move it. It remembers where you leave it, across restarts. |
 | Click the header | Collapse to just the header, or expand again. |
+| Hover over an active thread | After a moment, a pop-up beside the widget shows the full text of what the agent is doing right now (the whole message, reasoning, command and output, or tool input and output), scrolled to the newest lines. It updates live; move onto it to scroll. |
 | Click a thread | Bring T3 Code to the front. |
 | Click the activity graphic | Switch between the robot and the cat. |
 | Pinch in or out | Zoom between 100% and 300%. |
@@ -80,6 +82,8 @@ the widget.
   not under Ended, since its work is still in progress.
 - **Active threads**: title and elapsed time, then what the agent is doing right now with the
   project (and `@ machine` for threads on another machine), then the last lines of its output.
+  Hover for the full text (up to the last 20,000 characters; about 6,000 for threads on another
+  machine).
 - **Ended · last 24h**: threads that finished in the past day, most recent first, with how long
   ago you last interacted with them.
 - **Orange notes** under the header: a linked machine that couldn't be reached, and why.

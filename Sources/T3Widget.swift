@@ -34,6 +34,10 @@ enum Config {
     static let workingStatuses = ["preparing", "starting", "running"]
     static let endedStatuses = ["completed", "interrupted", "failed", "cancelled", "rolled_back"]
     static let zoomRange: ClosedRange<CGFloat> = 1...3
+    static let detailWidth: CGFloat = 460
+    static let detailMaxHeight: CGFloat = 420
+    static let hoverShowDelay: TimeInterval = 0.35
+    static let hoverHideDelay: TimeInterval = 0.4
 }
 
 // MARK: - Model
@@ -47,6 +51,7 @@ struct ActiveThread: Identifiable, Equatable {
     let startedAt: Date?
     let activity: String   // short label, e.g. "$ cargo test" or "Writing"
     let output: String     // tail of the latest output
+    let detail: String     // the latest item's full text, for the hover popup
 }
 
 struct RecentThread: Identifiable, Equatable {
@@ -108,33 +113,48 @@ func t3ServerIsRunning() -> Bool {
     return kill(pid, 0) == 0 || errno == EPERM
 }
 
-// MARK: - Turn items → (activity label, output tail)
+// MARK: - Turn items → (activity label, output tail, full text)
+
+struct ItemSummary {
+    var activity: String
+    var output: String  // last few lines, shown in the row
+    var detail: String  // full text, shown in the hover popup
+}
 
 func describeItem(type: String, text: String, input: String = "", output: String = "",
-                  tool: String = "", title: String = "") -> (String, String)? {
+                  tool: String = "", title: String = "") -> ItemSummary? {
+    func item(_ activity: String, _ body: String, detail: String? = nil) -> ItemSummary {
+        ItemSummary(activity: activity, output: tail(body), detail: full(detail ?? body))
+    }
     switch type {
     case "assistant_message":
-        return ("Writing", tail(text))
+        return item("Writing", text)
     case "reasoning":
-        return ("Thinking", tail(text))
+        return item("Thinking", text)
     case "command_execution":
-        if !input.isEmpty { return ("$ " + firstLine(input), tail(output)) }
+        if !input.isEmpty {
+            return item("$ " + firstLine(input), output, detail: "$ " + input + "\n\n" + output)
+        }
         // Remote items carry the command and its output in one text field: "$ cmd\n…".
         let lines = text.split(whereSeparator: \.isNewline)
         let cmd = lines.first.map(String.init) ?? ""
-        return (firstLine(cmd.hasPrefix("$ ") ? cmd : "$ " + cmd),
-                tail(lines.dropFirst().joined(separator: "\n")))
+        return item(firstLine(cmd.hasPrefix("$ ") ? cmd : "$ " + cmd),
+                    lines.dropFirst().joined(separator: "\n"), detail: text)
     case "dynamic_tool":
         let name = tool.isEmpty ? (title.isEmpty ? firstLine(text, max: 40) : title) : shortTool(tool)
-        return ("Tool: " + name, tail(output.isEmpty ? text : output))
+        let body = output.isEmpty ? text : output
+        let detail = input.isEmpty || input == "{}" ? body : "Input:\n" + input + "\n\nOutput:\n" + body
+        return item("Tool: " + name, body, detail: detail)
     case "file_change":
-        return ("Editing files", tail(title.isEmpty ? text : title))
+        return item("Editing files", title.isEmpty ? text : title,
+                    detail: [title, text].filter { !$0.isEmpty }.joined(separator: "\n\n"))
     case "web_search":
-        return ("Searching the web", tail(title.isEmpty ? text : title))
+        return item("Searching the web", title.isEmpty ? text : title)
     case "subagent":
-        return ("Running a subagent", tail(title.isEmpty ? text : title))
+        return item("Running a subagent", title.isEmpty ? text : title,
+                    detail: [title, text].filter { !$0.isEmpty }.joined(separator: "\n\n"))
     case "user_input_request":
-        return ("Waiting for your answer", "")
+        return item("Waiting for your answer", "", detail: text)
     default:
         return nil
     }
@@ -157,6 +177,12 @@ func firstLine(_ s: String, max: Int = 80) -> String {
 func shortTool(_ name: String) -> String {
     // mcp__t3-code__t3_thread_read → t3_thread_read
     name.components(separatedBy: "__").last ?? name
+}
+
+/// The whole text for the hover popup, capped at its last `maxChars` characters.
+func full(_ s: String, maxChars: Int = 20_000) -> String {
+    let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+    return t.count > maxChars ? "…" + String(t.suffix(maxChars)) : t
 }
 
 func tail(_ s: String, lines: Int = 3, maxChars: Int = 280) -> String {
@@ -279,7 +305,8 @@ final class T3Store: @unchecked Sendable {
             let runActive = Config.activeStatuses.contains(row.status)
             let busy = row.bgTasks > 0 || row.liveSubagents > 0
             if runActive || busy || row.pendingRequest != nil {
-                var (activity, output) = latestOutput(threadID: row.id)
+                let latest = latestOutput(threadID: row.id)
+                var activity = latest.activity
                 var status = row.status
                 if let kind = row.pendingRequest {
                     status = "needs_user"
@@ -291,7 +318,7 @@ final class T3Store: @unchecked Sendable {
                 snap.active.append(ActiveThread(
                     id: row.id, title: row.title, project: row.project, environment: nil,
                     status: status, startedAt: parseDate(row.requested),
-                    activity: activity, output: output))
+                    activity: activity, output: latest.output, detail: latest.detail))
             } else {
                 let last = [parseDate(row.completed), parseDate(row.lastUser)].compactMap { $0 }.max()
                 snap.recent.append(RecentThread(
@@ -302,8 +329,8 @@ final class T3Store: @unchecked Sendable {
         return snap
     }
 
-    /// The most recent meaningful turn item for a thread, as (activity label, output tail).
-    private func latestOutput(threadID: String) -> (String, String) {
+    /// The most recent meaningful turn item for a thread.
+    private func latestOutput(threadID: String) -> ItemSummary {
         let sql = """
             SELECT type,
                    json_extract(payload_json, '$.text'),
@@ -317,7 +344,7 @@ final class T3Store: @unchecked Sendable {
                            'file_change', 'web_search', 'subagent', 'user_input_request')
             ORDER BY ordinal DESC LIMIT 1
             """
-        var result = ("Starting…", "")
+        var result = ItemSummary(activity: "Starting…", output: "", detail: "")
         try? query(sql, [threadID]) { s in
             if let d = describeItem(type: text(s, 0) ?? "", text: text(s, 1) ?? "",
                                     input: text(s, 2) ?? "", output: text(s, 3) ?? "",
@@ -544,7 +571,8 @@ final class RemoteStore: @unchecked Sendable {
                 id: envID + "/" + id, title: t["title"] as? String ?? "Untitled",
                 project: titles[t["projectId"] as? String ?? ""] ?? "", environment: label,
                 status: t["status"] as? String ?? "", startedAt: latest?.started,
-                activity: latest?.activity ?? "Starting…", output: latest?.output ?? ""))
+                activity: latest?.summary.activity ?? "Starting…", output: latest?.summary.output ?? "",
+                detail: latest?.summary.detail ?? ""))
         }
         for t in try threads(envID, statuses: Config.endedStatuses, limit: 50) {
             guard let id = t["threadId"] as? String,
@@ -560,7 +588,7 @@ final class RemoteStore: @unchecked Sendable {
                     project: titles[t["projectId"] as? String ?? ""] ?? "", environment: label,
                     status: "waiting", startedAt: latest?.started,
                     activity: waitingLabel(bgTasks: work.tasks, subagents: work.subagents),
-                    output: latest?.output ?? ""))
+                    output: latest?.summary.output ?? "", detail: latest?.summary.detail ?? ""))
                 continue
             }
             snap.recent.append(RecentThread(
@@ -621,11 +649,11 @@ final class RemoteStore: @unchecked Sendable {
     }
 
     private func latestActivity(envID: String, threadID: String, itemCount: Int) throws
-        -> (activity: String, output: String, started: Date?)
+        -> (summary: ItemSummary, started: Date?)
     {
         var args: [String: Any] = [
             "environmentId": envID, "threadId": threadID, "view": "activity",
-            "limit": 4, "runLimit": 1, "maxCharsPerItem": 1500,
+            "limit": 4, "runLimit": 1, "maxCharsPerItem": 6000,
         ]
         if itemCount > 5 { args["afterPosition"] = itemCount - 5 }
         let result = try mcp.call("t3_thread_read", args)
@@ -633,10 +661,10 @@ final class RemoteStore: @unchecked Sendable {
         for item in (result["items"] as? [[String: Any]] ?? []).reversed() {
             if let d = describeItem(type: item["type"] as? String ?? "", text: item["text"] as? String ?? "",
                                     title: item["title"] as? String ?? "") {
-                return (d.0, d.1, started)
+                return (d, started)
             }
         }
-        return ("Starting…", "", started)
+        return (ItemSummary(activity: "Starting…", output: "", detail: ""), started)
     }
 }
 
@@ -680,7 +708,11 @@ final class WidgetModel: ObservableObject {
     @Published var collapsed = false
     @Published var zoom: CGFloat = Prefs.zoom.clamped(to: Config.zoomRange)
     @Published var mascot: MascotKind = Prefs.mascot
+    /// The active thread whose full text the hover popup shows, if any.
+    @Published var detailID: String?
     var onChange: (() -> Void)?
+    /// Each active row's frame, measured from the widget's top-left corner, for hover hit-testing.
+    var rowFrames: [String: CGRect] = [:]
 
     private let store = T3Store()
     private let remote = RemoteStore()
@@ -995,7 +1027,11 @@ struct WidgetView: View {
                 if model.snapshot.active.isEmpty && model.snapshot.recent.isEmpty {
                     Text("No active or recent threads").font(.system(size: 10 * z)).foregroundStyle(.secondary)
                 }
-                ForEach(model.snapshot.active) { ActiveRow(thread: $0, now: model.now) }
+                ForEach(model.snapshot.active) { thread in
+                    ActiveRow(thread: thread, now: model.now, highlighted: model.detailID == thread.id) {
+                        model.rowFrames[thread.id] = $0
+                    }
+                }
                 if !model.snapshot.recent.isEmpty {
                     Divider().opacity(0.4)
                     Text("ENDED · LAST 24H").font(.system(size: 9 * z, weight: .semibold))
@@ -1039,6 +1075,8 @@ struct WidgetView: View {
 struct ActiveRow: View {
     let thread: ActiveThread
     let now: Date
+    var highlighted = false
+    var onFrame: (CGRect) -> Void = { _ in }
     @Environment(\.zoom) private var z
     var body: some View {
         VStack(alignment: .leading, spacing: 3 * z) {
@@ -1057,11 +1095,54 @@ struct ActiveRow: View {
                     .lineLimit(3)
                     .padding(6 * z)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 6 * z))
+                    .background(.black.opacity(highlighted ? 0.3 : 0.18), in: RoundedRectangle(cornerRadius: 6 * z))
             }
         }
         .contentShape(Rectangle())
+        .background(GeometryReader { g in
+            Color.clear
+                .onAppear { onFrame(g.frame(in: .global)) }
+                .onChange(of: g.frame(in: .global)) { onFrame($0) }
+        })
         .onTapGesture(perform: openT3)
+    }
+}
+
+/// The hover popup: the full text of an active thread's latest turn item.
+struct DetailView: View {
+    @ObservedObject var model: WidgetModel
+
+    var body: some View {
+        let z = model.zoom
+        let thread = model.snapshot.active.first { $0.id == model.detailID }
+        VStack(alignment: .leading, spacing: 6 * z) {
+            if let thread {
+                Text(thread.title).font(.system(size: 12 * z, weight: .semibold)).lineLimit(2)
+                Text(thread.activity + " · " + place(thread.project, thread.environment))
+                    .font(.system(size: 10 * z, design: .monospaced)).foregroundStyle(.secondary).lineLimit(2)
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        Text(thread.detail)
+                            .font(.system(size: 10 * z, design: .monospaced))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(8 * z)
+                        Color.clear.frame(height: 1).id("end")
+                    }
+                    .frame(maxHeight: Config.detailMaxHeight * z)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 6 * z))
+                    // Start at the newest output, like a terminal.
+                    .onAppear { proxy.scrollTo("end", anchor: .bottom) }
+                    .onChange(of: thread.id) { _ in proxy.scrollTo("end", anchor: .bottom) }
+                }
+            }
+        }
+        .padding(10 * z)
+        .frame(width: Config.detailWidth * z, alignment: .leading)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12 * z))
+        .overlay(RoundedRectangle(cornerRadius: 12 * z).strokeBorder(.white.opacity(0.12)))
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -1133,6 +1214,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     let model = WidgetModel()
     var panel: WidgetPanel!
     var hosting: NSHostingView<WidgetView>!
+    var detailPanel: NSPanel!
+    var detailHosting: NSHostingView<DetailView>!
     let stayOnTopItem = NSMenuItem(title: "Stay on Top", action: #selector(toggleStayOnTop), keyEquivalent: "")
     let zoomMenu = NSMenu(title: "Zoom")
     let mascotMenu = NSMenu(title: "Activity Graphic")
@@ -1191,6 +1274,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         }
         hosting.menu = menu
 
+        detailHosting = NSHostingView(rootView: DetailView(model: model))
+        detailPanel = WidgetPanel(
+            contentRect: NSRect(x: 0, y: 0, width: Config.detailWidth, height: 100),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered, defer: false)
+        detailPanel.contentView = detailHosting
+        detailPanel.isOpaque = false
+        detailPanel.backgroundColor = .clear
+        detailPanel.hasShadow = true
+        detailPanel.hidesOnDeactivate = false
+        detailPanel.isMovable = false
+        // The app is never active, so tracking areas are unreliable: poll the pointer instead.
+        Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.trackPointer() }
+        }
+
         model.onChange = { [weak self] in self?.layout() }
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
@@ -1237,11 +1336,98 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         if panel.isVisible { panel.orderFrontRegardless() }
     }
 
+    // MARK: Hover popup
+
+    private var hoverCandidate: (id: String, since: Date)?
+    private var pointerLastInside = Date.distantPast
+
+    /// The active row under the pointer (with its frame from the widget's top-left), if any.
+    private func rowUnderPointer(_ p: NSPoint) -> (id: String, frame: CGRect)? {
+        for thread in model.snapshot.active where !thread.detail.isEmpty {
+            guard let f = model.rowFrames[thread.id] else { continue }
+            let onScreen = NSRect(x: panel.frame.minX + f.minX, y: panel.frame.maxY - f.maxY,
+                                  width: f.width, height: f.height)
+            if onScreen.contains(p) { return (thread.id, f) }
+        }
+        return nil
+    }
+
+    /// Show the popup after a short pause on a row; switch rows at once while it's open;
+    /// keep it while the pointer is over it; hide it shortly after the pointer leaves both.
+    func trackPointer() {
+        guard panel.isVisible, !model.collapsed else {
+            if model.detailID != nil { hideDetail() }
+            return
+        }
+        let p = NSEvent.mouseLocation
+        let now = Date()
+        if let row = rowUnderPointer(p) {
+            pointerLastInside = now
+            if hoverCandidate?.id != row.id { hoverCandidate = (row.id, now) }
+            let open = model.detailID != nil
+            if model.detailID != row.id,
+               open || now.timeIntervalSince(hoverCandidate!.since) >= Config.hoverShowDelay {
+                hoveredRow = row
+                showDetail()
+            }
+        } else {
+            hoverCandidate = nil
+            if detailPanel.isVisible && detailPanel.frame.contains(p) {
+                pointerLastInside = now
+            } else if model.detailID != nil,
+                      now.timeIntervalSince(pointerLastInside) >= Config.hoverHideDelay {
+                hideDetail()
+            }
+        }
+    }
+
+    private var hoveredRow: (id: String, frame: CGRect)?
+
+    private func showDetail() {
+        guard let row = hoveredRow, panel.isVisible,
+              model.snapshot.active.contains(where: { $0.id == row.id && !$0.detail.isEmpty }) else { return }
+        model.detailID = row.id
+        // Let SwiftUI lay out the new text before sizing the panel.
+        DispatchQueue.main.async { self.positionDetail() }
+    }
+
+    func hideDetail() {
+        hoveredRow = nil
+        hoverCandidate = nil
+        model.detailID = nil
+        detailPanel.orderOut(nil)
+    }
+
+    /// Beside the widget (right side, or left if there's no room), top-aligned with the row.
+    private func positionDetail() {
+        guard let id = model.detailID else { return }
+        let row = (id: id, frame: model.rowFrames[id] ?? .zero)
+        guard model.snapshot.active.contains(where: { $0.id == row.id && !$0.detail.isEmpty }) else {
+            hideDetail(); return
+        }
+        detailHosting.layoutSubtreeIfNeeded()
+        let size = detailHosting.fittingSize
+        let screen = panel.screen ?? NSScreen.main ?? NSScreen.screens[0]
+        let visible = screen.visibleFrame
+        let gap: CGFloat = 6
+        var x = panel.frame.maxX + gap
+        if x + size.width > visible.maxX { x = panel.frame.minX - gap - size.width }
+        x = x.clamped(to: visible.minX...max(visible.minX, visible.maxX - size.width))
+        // Row frames are measured from the widget's top-left corner.
+        let rowTop = row.frame == .zero ? detailPanel.frame.maxY : panel.frame.maxY - row.frame.minY
+        let top = rowTop.clamped(to: (visible.minY + size.height)...visible.maxY)
+        detailPanel.level = panel.level
+        detailPanel.collectionBehavior = panel.collectionBehavior
+        detailPanel.setFrame(NSRect(x: x, y: top - size.height, width: size.width, height: size.height),
+                             display: true)
+        detailPanel.orderFrontRegardless()
+    }
+
     private var layingOut = false
 
     /// Fires after the user drags the widget (and after our own resizes, which we skip).
     func windowDidMove(_ notification: Notification) {
-        if !layingOut { saveTopLeft() }
+        if !layingOut { saveTopLeft(); hideDetail() }
     }
 
     func saveTopLeft() {
@@ -1250,7 +1436,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     /// Keep the widget's top-left corner fixed (saved spot, or the default corner) as it grows.
     func layout() {
-        guard model.snapshot.online else { panel.orderOut(nil); return }
+        guard model.snapshot.online else { panel.orderOut(nil); hideDetail(); return }
         hosting.layoutSubtreeIfNeeded()
         let size = hosting.fittingSize
         guard let main = NSScreen.screens.first else { return }
@@ -1265,6 +1451,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                               width: size.width, height: size.height), display: true)
         layingOut = false
         if !panel.isVisible { panel.orderFrontRegardless() }
+        if model.detailID != nil { positionDetail() }  // follow content and row changes
     }
 }
 
