@@ -170,6 +170,25 @@ func waitingLabel(bgTasks: Int, subagents: Int) -> String {
     return parts.isEmpty ? "Waiting" : "Waiting on " + parts.joined(separator: ", ")
 }
 
+/// Task IDs of commands sent to the background, from a tool item's text
+/// ("Command running in background with ID: blntviap5.").
+func backgroundTaskIDs(in text: String) -> [String] {
+    let marker = "running in background with ID: "
+    var ids: [String] = []
+    var rest = text[...]
+    while let r = rest.range(of: marker) {
+        let id = rest[r.upperBound...].prefix { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" }
+        if !id.isEmpty { ids.append(String(id)) }
+        rest = rest[r.upperBound...]
+    }
+    return ids
+}
+
+/// True for a tool call that collects or ends a background task (its text names the task ID).
+func stopsTask(_ text: String) -> Bool {
+    ["\"TaskOutput\"", "\"TaskStop\"", "\"KillShell\"", "\"KillBash\""].contains { text.contains($0) }
+}
+
 func firstLine(_ s: String, max: Int = 80) -> String {
     let line = s.split(whereSeparator: \.isNewline).first.map(String.init) ?? s
     return line.count > max ? String(line.prefix(max)) + "…" : line
@@ -600,25 +619,38 @@ final class RemoteStore: @unchecked Sendable {
     }
 
     /// Counts the thread's subagents and background commands still running. The MCP API has
-    /// no summary of this, so it pages through the timeline, only when updatedAt changes.
+    /// no summary of this, so it pages through the latest run's timeline, only when updatedAt
+    /// changes.
+    ///
+    /// A command sent to the background shows as a *completed* item whose output reads
+    /// "Command running in background with ID: X". Its completion wakes the agent in a new
+    /// run, so within the latest run such a task counts as pending unless the agent collected
+    /// or stopped it there (TaskOutput, TaskStop, KillShell naming that ID).
     private func backgroundWork(envID: String, threadID: String, updatedAt: String) throws
         -> (tasks: Int, subagents: Int)
     {
         let key = envID + "/" + threadID
         if let c = backgroundCache[key], c.updatedAt == updatedAt { return (c.tasks, c.subagents) }
         var tasks = 0, subagents = 0
+        var launched: [String] = [], reaped: [String] = []
         var after: Int?
         for _ in 0..<20 {
             var args: [String: Any] = [
                 "environmentId": envID, "threadId": threadID, "view": "activity",
-                "limit": 100, "runLimit": 1, "maxCharsPerItem": 1,
+                "limit": 100, "runLimit": 1, "maxCharsPerItem": 4000,
             ]
             if let after { args["afterPosition"] = after }
             let page = try mcp.call("t3_thread_read", args)
             for item in page["items"] as? [[String: Any]] ?? [] {
                 let status = item["status"] as? String ?? ""
+                let type = item["type"] as? String ?? ""
+                let text = item["text"] as? String ?? ""
+                if type == "command_execution" || type == "dynamic_tool" {
+                    launched += backgroundTaskIDs(in: text)
+                    if type == "dynamic_tool", stopsTask(text) { reaped.append(text) }
+                }
                 guard status == "running" || status == "waiting" else { continue }
-                switch item["type"] as? String ?? "" {
+                switch type {
                 case "subagent": subagents += 1
                 case "command_execution", "dynamic_tool": tasks += 1
                 default: break
@@ -627,6 +659,7 @@ final class RemoteStore: @unchecked Sendable {
             guard page["hasMore"] as? Bool == true, let next = page["nextPosition"] as? Int else { break }
             after = next
         }
+        tasks += Set(launched).filter { id in !reaped.contains { $0.contains(id) } }.count
         backgroundCache[key] = (updatedAt, tasks, subagents)
         return (tasks, subagents)
     }
