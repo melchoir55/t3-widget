@@ -140,6 +140,15 @@ func describeItem(type: String, text: String, input: String = "", output: String
     }
 }
 
+/// e.g. "Waiting on 2 background tasks, 1 subagent".
+func waitingLabel(bgTasks: Int, subagents: Int) -> String {
+    func plural(_ n: Int, _ word: String) -> String { "\(n) \(word)\(n == 1 ? "" : "s")" }
+    var parts: [String] = []
+    if bgTasks > 0 { parts.append(plural(bgTasks, "background task")) }
+    if subagents > 0 { parts.append(plural(subagents, "subagent")) }
+    return parts.isEmpty ? "Waiting" : "Waiting on " + parts.joined(separator: ", ")
+}
+
 func firstLine(_ s: String, max: Int = 80) -> String {
     let line = s.split(whereSeparator: \.isNewline).first.map(String.init) ?? s
     return line.count > max ? String(line.prefix(max)) + "…" : line
@@ -208,32 +217,58 @@ final class T3Store: @unchecked Sendable {
         let statuses = Config.activeStatuses.map { "'\($0)'" }.joined(separator: ",")
         let cutoff = isoString(Date().addingTimeInterval(-Config.recentWindow))
 
-        // One row per top-level thread whose latest run is active or ended in the window.
+        // One row per top-level thread whose latest run is active or ended in the window, or
+        // that is still busy after its run ended: background commands/monitors, subagents that
+        // are running or have results not yet delivered, or a question/approval awaiting the user.
+        // T3's sidebar labels those "Waiting" / "Awaiting Input", not ended.
         let threadsSQL = """
-            SELECT t.thread_id, t.title, COALESCE(p.title, ''), r.status, r.requested_at,
-                   r.completed_at,
-                   (SELECT MAX(m.updated_at) FROM orchestration_v2_projection_messages m
-                     WHERE m.thread_id = t.thread_id AND m.role = 'user') AS last_user
-            FROM orchestration_v2_projection_threads t
-            JOIN orchestration_v2_projection_runs r
-              ON r.thread_id = t.thread_id
-             AND r.ordinal = (SELECT MAX(ordinal) FROM orchestration_v2_projection_runs
-                               WHERE thread_id = t.thread_id)
-            LEFT JOIN projection_projects p ON p.project_id = t.project_id
-            WHERE t.archived_at IS NULL AND t.deleted_at IS NULL
-              AND COALESCE(json_extract(t.payload_json, '$.lineage.relationshipToParent'), '')
-                  <> 'subagent'
-              AND (r.status IN (\(statuses)) OR r.completed_at >= ?1)
+            SELECT thread_id, title, project, status, requested_at, completed_at, last_user,
+                   bg_tasks, live_subagents, pending_request
+            FROM (
+              SELECT t.thread_id, t.title, COALESCE(p.title, '') AS project, r.status,
+                     r.requested_at, r.completed_at,
+                     (SELECT MAX(m.updated_at) FROM orchestration_v2_projection_messages m
+                       WHERE m.thread_id = t.thread_id AND m.role = 'user') AS last_user,
+                     (SELECT COALESCE(SUM(json_array_length(pt.payload_json, '$.pendingBackgroundTasks')), 0)
+                        FROM orchestration_v2_projection_provider_threads pt
+                       WHERE pt.thread_id = t.thread_id) AS bg_tasks,
+                     (SELECT COUNT(*) FROM orchestration_v2_projection_subagents s
+                       WHERE s.thread_id = t.thread_id
+                         AND (s.status IN (\(statuses))
+                              OR s.completion_delivery_state IN ('pending', 'claimed'))) AS live_subagents,
+                     (SELECT q.kind FROM orchestration_v2_projection_runtime_requests q
+                       WHERE q.thread_id = t.thread_id AND q.status = 'pending'
+                       ORDER BY q.created_at DESC LIMIT 1) AS pending_request
+              FROM orchestration_v2_projection_threads t
+              JOIN orchestration_v2_projection_runs r
+                ON r.thread_id = t.thread_id
+               AND r.ordinal = (SELECT MAX(ordinal) FROM orchestration_v2_projection_runs
+                                 WHERE thread_id = t.thread_id)
+              LEFT JOIN projection_projects p ON p.project_id = t.project_id
+              WHERE t.archived_at IS NULL AND t.deleted_at IS NULL
+                AND COALESCE(json_extract(t.payload_json, '$.lineage.relationshipToParent'), '')
+                    <> 'subagent'
+            )
+            WHERE status IN (\(statuses)) OR completed_at >= ?1
+               OR bg_tasks > 0 OR live_subagents > 0 OR pending_request IS NOT NULL
             """
 
-        struct Row { let id, title, project, status: String; let requested, completed, lastUser: String? }
+        struct Row {
+            let id, title, project, status: String
+            let requested, completed, lastUser: String?
+            let bgTasks, liveSubagents: Int
+            let pendingRequest: String?
+        }
         var rows: [Row] = []
         do {
             try query(threadsSQL, [cutoff]) { s in
                 rows.append(Row(
                     id: text(s, 0) ?? "", title: text(s, 1) ?? "Untitled",
                     project: text(s, 2) ?? "", status: text(s, 3) ?? "",
-                    requested: text(s, 4), completed: text(s, 5), lastUser: text(s, 6)))
+                    requested: text(s, 4), completed: text(s, 5), lastUser: text(s, 6),
+                    bgTasks: Int(sqlite3_column_int(s, 7)),
+                    liveSubagents: Int(sqlite3_column_int(s, 8)),
+                    pendingRequest: text(s, 9)))
             }
         } catch {
             snap.error = error.localizedDescription
@@ -241,11 +276,21 @@ final class T3Store: @unchecked Sendable {
         }
 
         for row in rows {
-            if Config.activeStatuses.contains(row.status) {
-                let (activity, output) = latestOutput(threadID: row.id)
+            let runActive = Config.activeStatuses.contains(row.status)
+            let busy = row.bgTasks > 0 || row.liveSubagents > 0
+            if runActive || busy || row.pendingRequest != nil {
+                var (activity, output) = latestOutput(threadID: row.id)
+                var status = row.status
+                if let kind = row.pendingRequest {
+                    status = "needs_user"
+                    activity = kind == "user_input" ? "Waiting for your answer" : "Needs your approval"
+                } else if !runActive || row.status == "waiting" {
+                    status = "waiting"
+                    activity = waitingLabel(bgTasks: row.bgTasks, subagents: row.liveSubagents)
+                }
                 snap.active.append(ActiveThread(
                     id: row.id, title: row.title, project: row.project, environment: nil,
-                    status: row.status, startedAt: parseDate(row.requested),
+                    status: status, startedAt: parseDate(row.requested),
                     activity: activity, output: output))
             } else {
                 let last = [parseDate(row.completed), parseDate(row.lastUser)].compactMap { $0 }.max()
@@ -449,6 +494,8 @@ final class McpClient {
 final class RemoteStore: @unchecked Sendable {
     private let mcp = McpClient()
     private var projectTitles: [String: (fetched: Date, titles: [String: String])] = [:]
+    /// Background work per ended thread, keyed by env/thread and reused until updatedAt changes.
+    private var backgroundCache: [String: (updatedAt: String, tasks: Int, subagents: Int)] = [:]
 
     func snapshot() -> Snapshot {
         var snap = Snapshot()
@@ -502,11 +549,57 @@ final class RemoteStore: @unchecked Sendable {
         for t in try threads(envID, statuses: Config.endedStatuses, limit: 50) {
             guard let id = t["threadId"] as? String,
                   let updated = parseDate(t["updatedAt"] as? String), updated >= cutoff else { continue }
+            // A finished turn can leave subagents or background commands running: in progress.
+            if let work = try? backgroundWork(envID: envID, threadID: id,
+                                              updatedAt: t["updatedAt"] as? String ?? ""),
+               work.tasks + work.subagents > 0 {
+                let latest = try? latestActivity(envID: envID, threadID: id,
+                                                 itemCount: t["itemCount"] as? Int ?? 0)
+                snap.active.append(ActiveThread(
+                    id: envID + "/" + id, title: t["title"] as? String ?? "Untitled",
+                    project: titles[t["projectId"] as? String ?? ""] ?? "", environment: label,
+                    status: "waiting", startedAt: latest?.started,
+                    activity: waitingLabel(bgTasks: work.tasks, subagents: work.subagents),
+                    output: latest?.output ?? ""))
+                continue
+            }
             snap.recent.append(RecentThread(
                 id: envID + "/" + id, title: t["title"] as? String ?? "Untitled",
                 project: titles[t["projectId"] as? String ?? ""] ?? "", environment: label,
                 status: t["status"] as? String ?? "", lastInteraction: updated))
         }
+    }
+
+    /// Counts the thread's subagents and background commands still running. The MCP API has
+    /// no summary of this, so it pages through the timeline, only when updatedAt changes.
+    private func backgroundWork(envID: String, threadID: String, updatedAt: String) throws
+        -> (tasks: Int, subagents: Int)
+    {
+        let key = envID + "/" + threadID
+        if let c = backgroundCache[key], c.updatedAt == updatedAt { return (c.tasks, c.subagents) }
+        var tasks = 0, subagents = 0
+        var after: Int?
+        for _ in 0..<20 {
+            var args: [String: Any] = [
+                "environmentId": envID, "threadId": threadID, "view": "activity",
+                "limit": 100, "runLimit": 1, "maxCharsPerItem": 1,
+            ]
+            if let after { args["afterPosition"] = after }
+            let page = try mcp.call("t3_thread_read", args)
+            for item in page["items"] as? [[String: Any]] ?? [] {
+                let status = item["status"] as? String ?? ""
+                guard status == "running" || status == "waiting" else { continue }
+                switch item["type"] as? String ?? "" {
+                case "subagent": subagents += 1
+                case "command_execution", "dynamic_tool": tasks += 1
+                default: break
+                }
+            }
+            guard page["hasMore"] as? Bool == true, let next = page["nextPosition"] as? Int else { break }
+            after = next
+        }
+        backgroundCache[key] = (updatedAt, tasks, subagents)
+        return (tasks, subagents)
     }
 
     /// Project id → title for an environment, refreshed every 5 minutes.
@@ -870,6 +963,7 @@ struct StatusDot: View {
         switch status {
         case "running", "starting", "preparing": return .green
         case "waiting", "queued": return .yellow
+        case "needs_user": return .purple
         case "completed": return .secondary
         case "failed": return .red
         default: return .orange  // interrupted, cancelled, rolled_back
@@ -955,8 +1049,7 @@ struct ActiveRow: View {
                 Text(relative(thread.startedAt, now: now))
                     .font(.system(size: 10 * z).monospacedDigit()).foregroundStyle(.secondary)
             }
-            Text((thread.status == "waiting" ? "Waiting for input" : thread.activity)
-                 + " · " + place(thread.project, thread.environment))
+            Text(thread.activity + " · " + place(thread.project, thread.environment))
                 .font(.system(size: 10 * z, design: .monospaced)).foregroundStyle(.secondary).lineLimit(1)
             if !thread.output.isEmpty {
                 Text(thread.output)

@@ -73,8 +73,11 @@ the widget.
 
 - **Header**: the activity graphic, then how many threads are active. The graphic animates while
   any thread is working (running, starting or preparing) and rests when nothing is.
-- **Status dots**: green = working, yellow = queued or waiting for your input, gray = completed,
-  red = failed, orange = interrupted, cancelled or rolled back.
+- **Status dots**: green = working, yellow = queued or waiting, purple = waiting for your answer
+  or approval, gray = completed, red = failed, orange = interrupted, cancelled or rolled back.
+- **Waiting**: a thread whose turn finished but that still has subagents or background
+  commands running stays in the active list as *waiting* (e.g. "Waiting on 2 subagents"),
+  not under Ended, since its work is still in progress.
 - **Active threads**: title and elapsed time, then what the agent is doing right now with the
   project (and `@ machine` for threads on another machine), then the last lines of its output.
 - **Ended · last 24h**: threads that finished in the past day, most recent first, with how long
