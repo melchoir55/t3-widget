@@ -11,6 +11,8 @@ A small always-on-top **macOS** panel for T3 Code, pinned to the top-left corner
 
 It hides itself whenever the T3 Code server isn't running.
 
+<img src="docs/screenshot.png" alt="T3 Widget showing an active thread on a linked machine and threads that ended in the last 24 hours" width="390">
+
 ## How it works
 
 - **This Mac**: it polls T3's local state DB (`~/.t3/userdata/statev2.sqlite`) every 2 s,
